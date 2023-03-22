@@ -41,6 +41,14 @@ except ImportError:
     _tpu_available = False
 
 
+# Cache this result has it's a C FFI call which can be pretty time-consuming
+_torch_distributed_available = torch.distributed.is_available()
+
+
+def is_torch_distributed_available() -> bool:
+    return _torch_distributed_available
+
+
 def is_ccl_available():
     return (
         importlib.util.find_spec("torch_ccl") is not None
@@ -54,6 +62,10 @@ def get_ccl_version():
 
 def is_apex_available():
     return importlib.util.find_spec("apex") is not None
+
+
+def is_fp8_available():
+    return importlib.util.find_spec("transformer_engine") is not None
 
 
 @lru_cache()

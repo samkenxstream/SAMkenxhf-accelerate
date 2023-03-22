@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from distutils.util import strtobool
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -139,6 +139,38 @@ class InitProcessGroupKwargs(KwargsHandler):
 
     init_method: Optional[str] = None
     timeout: timedelta = timedelta(seconds=1800)
+
+
+@dataclass
+class FP8RecipeKwargs(KwargsHandler):
+    """
+    Use this object in your [`Accelerator`] to customize the initialization of the recipe for FP8 mixed precision
+    training. Please refer to the documentation of this
+    [class](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/common.html#transformer_engine.common.recipe.DelayedScaling)
+    for more information on each argument.
+
+    ```python
+    from accelerate import Accelerator
+    from accelerate.utils import FP8RecipeKwargs
+
+    kwargs = FP8RecipeKwargs(fp8_format="HYBRID")
+    accelerator = Accelerator(mixed_precision="fp8", kwargs_handlers=[kwargs])
+    ```
+    """
+
+    margin: int = 0
+    interval: int = 1
+    fp8_format: str = "E4M3"
+    amax_history_len: int = 1
+    amax_compute_algo: str = "most_recent"
+    override_linear_precision: Tuple[bool, bool, bool] = (False, False, False)
+
+    def __post_init__(self):
+        self.fp8_format = self.fp8_format.upper()
+        if self.fp8_format not in ["E4M3", "HYBRID"]:
+            raise ValueError("`fp8_format` must be 'E4M3' or 'HYBRID'.")
+        if self.amax_compute_algo not in ["max", "most_recent"]:
+            raise ValueError("`amax_compute_algo` must be 'max' or 'most_recent'")
 
 
 class DistributedType(str, enum.Enum):
@@ -294,6 +326,7 @@ class PrecisionType(BaseEnum):
     """
 
     NO = "no"
+    FP8 = "fp8"
     FP16 = "fp16"
     BF16 = "bf16"
 
@@ -345,6 +378,57 @@ class ProjectConfiguration:
     def __post_init__(self):
         if self.logging_dir is None:
             self.logging_dir = self.project_dir
+
+
+@dataclass
+class GradientAccumulationPlugin(KwargsHandler):
+    """
+    A plugin to configure gradient accumulation behavior.
+    """
+
+    num_steps: int = field(default=None, metadata={"help": "The number of steps to accumulate gradients for."})
+    adjust_scheduler: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to adjust the scheduler steps to account for the number of steps being accumulated. Should be `True` if the used scheduler was not adjusted for gradient accumulation."
+        },
+    )
+
+
+@dataclass
+class TorchDynamoPlugin(KwargsHandler):
+    """
+    This plugin is used to compile a model with PyTorch 2.0
+    """
+
+    backend: DynamoBackend = field(
+        default=None,
+        metadata={"help": f"Possible options are {[b.value.lower() for b in DynamoBackend]}"},
+    )
+    mode: str = field(
+        default=None, metadata={"help": "Possible options are 'default', 'reduce-overhead' or 'max-autotune'"}
+    )
+    fullgraph: bool = field(default=None, metadata={"help": "Whether it is ok to break model into several subgraphs"})
+    dynamic: bool = field(default=None, metadata={"help": "Whether to use dynamic shape for tracing"})
+    options: Any = field(default=None, metadata={"help": "A dictionary of options to pass to the backend."})
+    disable: bool = field(default=False, metadata={"help": "Turn torch.compile() into a no-op for testing"})
+
+    def __post_init__(self):
+        prefix = "ACCELERATE_DYNAMO_"
+        if self.backend is None:
+            self.backend = os.environ.get(prefix + "BACKEND", "no")
+        self.backend = DynamoBackend(self.backend.upper())
+        if self.mode is None:
+            self.mode = os.environ.get(prefix + "MODE", "default")
+        if self.fullgraph is None:
+            self.fullgraph = strtobool(os.environ.get(prefix + "USE_FULLGRAPH", "False")) == 1
+        if self.dynamic is None:
+            self.dynamic = strtobool(os.environ.get(prefix + "USE_DYNAMIC", "False")) == 1
+
+    def to_dict(self):
+        dynamo_config = copy.deepcopy(self.__dict__)
+        dynamo_config["backend"] = dynamo_config["backend"].value.lower()
+        return dynamo_config
 
 
 @dataclass
@@ -675,6 +759,11 @@ class FullyShardedDataParallelPlugin:
         },
     )
 
+    use_orig_params: bool = field(
+        default=False,
+        metadata={"help": "If True, enables parameter-efficient fine-tuning"},
+    )
+
     def __post_init__(self):
         from torch.distributed.fsdp.fully_sharded_data_parallel import (
             BackwardPrefetch,
@@ -731,16 +820,19 @@ class FullyShardedDataParallelPlugin:
         if self.auto_wrap_policy is None:
             auto_wrap_policy = os.environ.get("FSDP_AUTO_WRAP_POLICY", "NO_WRAP")
             if auto_wrap_policy == FSDP_AUTO_WRAP_POLICY[0]:
-                transformer_cls_to_wrap = os.environ.get("FSDP_TRANSFORMER_CLS_TO_WRAP", "")
-                transformer_cls_to_wrap = FullyShardedDataParallelPlugin.get_module_class_from_name(
-                    model, transformer_cls_to_wrap
-                )
-                if transformer_cls_to_wrap is None:
-                    raise Exception("Could not find the transformer layer class to wrap in the model.")
+                transformer_cls_names_to_wrap = os.environ.get("FSDP_TRANSFORMER_CLS_TO_WRAP", "").split(",")
+                transformer_cls_to_wrap = set()
+                for layer_class in transformer_cls_names_to_wrap:
+                    transformer_cls = FullyShardedDataParallelPlugin.get_module_class_from_name(model, layer_class)
+                    if transformer_cls is None:
+                        raise Exception("Could not find the transformer layer class to wrap in the model.")
+                    else:
+                        transformer_cls_to_wrap.add(transformer_cls)
+
                 self.auto_wrap_policy = functools.partial(
                     transformer_auto_wrap_policy,
                     # Transformer layer class to wrap
-                    transformer_layer_cls={transformer_cls_to_wrap},
+                    transformer_layer_cls=transformer_cls_to_wrap,
                 )
             elif auto_wrap_policy == FSDP_AUTO_WRAP_POLICY[1]:
                 min_num_params = int(os.environ.get("FSDP_MIN_NUM_PARAMS", 0))

@@ -56,16 +56,18 @@ def process_execution_check():
     with accelerator.main_process_first():
         idx = torch.tensor(accelerator.process_index).to(accelerator.device)
     idxs = accelerator.gather(idx)
-    assert idxs[0] == 0, "Main process was not first."
+    if num_processes > 1:
+        assert idxs[0] == 0, "Main process was not first."
 
     # Test the decorators
     f = io.StringIO()
     with contextlib.redirect_stdout(f):
         accelerator.on_main_process(print_main)(accelerator.state)
+    result = f.getvalue().rstrip()
     if accelerator.is_main_process:
-        assert f.getvalue().rstrip() == "Printing from the main process 0"
+        assert result == "Printing from the main process 0", f"{result} != Printing from the main process 0"
     else:
-        assert f.getvalue().rstrip() == ""
+        assert f.getvalue().rstrip() == "", f'{result} != ""'
     f.truncate(0)
     f.seek(0)
 

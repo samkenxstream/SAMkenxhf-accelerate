@@ -14,6 +14,7 @@
 
 import gc
 import json
+import logging
 import os
 import re
 import shutil
@@ -33,6 +34,9 @@ if is_safetensors_available():
     from safetensors.torch import load_file as safe_load_file
 
 WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
+
+
+logger = logging.getLogger(__name__)
 
 
 def convert_file_size_to_int(size: Union[int, str]):
@@ -255,19 +259,36 @@ def retie_parameters(model, tied_params):
         setattr(tied_module, tied_param_name.split(".")[-1], param)
 
 
-def compute_module_sizes(model: nn.Module, dtype: Optional[Union[str, torch.device]] = None):
+def _get_proper_dtype(dtype: Union[str, torch.device]) -> torch.dtype:
     """
-    Compute the size of each submodule of a given model.
+    Just does torch.dtype(dtype) if necessary.
     """
     if isinstance(dtype, str):
         # We accept "torch.float16" or just "float16"
         dtype = dtype.replace("torch.", "")
         dtype = getattr(torch, dtype)
+    return dtype
+
+
+def compute_module_sizes(
+    model: nn.Module,
+    dtype: Optional[Union[str, torch.device]] = None,
+    special_dtypes: Optional[Dict[str, Union[str, torch.device]]] = None,
+):
+    """
+    Compute the size of each submodule of a given model.
+    """
     if dtype is not None:
+        dtype = _get_proper_dtype(dtype)
         dtype_size = dtype_byte_size(dtype)
+    if special_dtypes is not None:
+        special_dtypes = {key: _get_proper_dtype(dtyp) for key, dtyp in special_dtypes.items()}
+        special_dtypes_size = {key: dtype_byte_size(dtyp) for key, dtyp in special_dtypes.items()}
     module_sizes = defaultdict(int)
     for name, tensor in named_module_tensors(model, recurse=True):
-        if dtype is None:
+        if special_dtypes is not None and name in special_dtypes:
+            size = tensor.numel() * special_dtypes_size[name]
+        elif dtype is None:
             size = tensor.numel() * dtype_byte_size(tensor.dtype)
         else:
             size = tensor.numel() * min(dtype_size, dtype_byte_size(tensor.dtype))
@@ -390,6 +411,7 @@ def get_balanced_memory(
     max_memory: Optional[Dict[Union[int, str], Union[int, str]]] = None,
     no_split_module_classes: Optional[List[str]] = None,
     dtype: Optional[Union[str, torch.dtype]] = None,
+    special_dtypes: Optional[Dict[str, Union[str, torch.device]]] = None,
     low_zero: bool = False,
 ):
     """
@@ -412,6 +434,9 @@ def get_balanced_memory(
             residual connection).
         dtype (`str` or `torch.dtype`, *optional*):
             If provided, the weights will be converted to that type when loaded.
+        special_dtypes (`Dict[str, Union[str, torch.device]]`, *optional*):
+            If provided, special dtypes to consider for some specific weights (will override dtype used as default for
+            all weights).
         low_zero (`bool`, *optional*):
             Minimizes the number of weights on GPU 0, which is convenient when it's used for other operations (like the
             Transformers generate function).
@@ -423,7 +448,7 @@ def get_balanced_memory(
         return max_memory
 
     num_devices = len([d for d in max_memory if torch.device(d).type == "cuda" and max_memory[d] > 0])
-    module_sizes = compute_module_sizes(model, dtype=dtype)
+    module_sizes = compute_module_sizes(model, dtype=dtype, special_dtypes=special_dtypes)
     per_gpu = module_sizes[""] // (num_devices - 1 if low_zero else num_devices)
 
     # We can't just set the memory to model_size // num_devices as it will end being too small: each GPU will get
@@ -482,6 +507,7 @@ def infer_auto_device_map(
     max_memory: Optional[Dict[Union[int, str], Union[int, str]]] = None,
     no_split_module_classes: Optional[List[str]] = None,
     dtype: Optional[Union[str, torch.dtype]] = None,
+    special_dtypes: Optional[Dict[str, Union[str, torch.dtype]]] = None,
 ):
     """
     Compute a device map for a given model giving priority to GPUs, then offload on CPU and finally offload to disk,
@@ -510,6 +536,9 @@ def infer_auto_device_map(
             residual connection).
         dtype (`str` or `torch.dtype`, *optional*):
             If provided, the weights will be converted to that type when loaded.
+        special_dtypes (`Dict[str, Union[str, torch.device]]`, *optional*):
+            If provided, special dtypes to consider for some specific weights (will override dtype used as default for
+            all weights).
     """
     # Get default / clean up max_memory
     max_memory = get_max_memory(max_memory)
@@ -526,7 +555,7 @@ def infer_auto_device_map(
     # Devices that need to keep space for a potential offloaded layer.
     main_devices = [gpus[0], "cpu"] if len(gpus) > 0 else ["cpu"]
 
-    module_sizes = compute_module_sizes(model, dtype=dtype)
+    module_sizes = compute_module_sizes(model, dtype=dtype, special_dtypes=special_dtypes)
     tied_parameters = find_tied_parameters(model)
 
     device_map = {}
@@ -667,6 +696,14 @@ def load_state_dict(checkpoint_file, device_map=None):
         with safe_open(checkpoint_file, framework="pt") as f:
             metadata = f.metadata()
             weight_names = f.keys()
+
+        if metadata is None:
+            logger.warn(
+                f"The safetensors archive passed at {checkpoint_file} does not contain metadata. "
+                "Make sure to save your model with the `save_pretrained` method. Defaulting to 'pt' metadata."
+            )
+            metadata = {"format": "pt"}
+
         if metadata.get("format") not in ["pt", "tf", "flax"]:
             raise OSError(
                 f"The safetensors archive passed at {checkpoint_file} does not contain the valid metadata. Make sure "
@@ -679,13 +716,22 @@ def load_state_dict(checkpoint_file, device_map=None):
         else:
             devices = [device for device in device_map.values() if device not in ["disk"]]
 
+            # if we only have one device we can load everything directly
+            if len(devices) == 1:
+                return safe_load_file(checkpoint_file, device=devices[0])
+
+            # cpu device should always exist as fallback option
+            if "cpu" not in devices:
+                devices.append("cpu")
+
             # For each device, get the weights that go there
             device_weights = {device: [] for device in devices}
             for module_name, device in device_map.items():
                 if device in devices:
                     device_weights[device].extend([k for k in weight_names if k.startswith(module_name)])
-            device_weights["cpu"].extend([k for k in weight_names if k not in device_weights])
 
+            # all weights that haven't defined a device should be loaded on CPU
+            device_weights["cpu"].extend([k for k in weight_names if k not in sum(device_weights.values(), [])])
             tensors = {}
             for device in devices:
                 with safe_open(checkpoint_file, framework="pt", device=device) as f:
@@ -738,6 +784,7 @@ def load_checkpoint_in_model(
         offload_buffers (`bool`, *optional*, defaults to `False):
             Whether or not to include the buffers in the weights offloaded to disk.
     """
+    tied_params = find_tied_parameters(model)
     if offload_folder is None and device_map is not None and "disk" in device_map.values():
         raise ValueError(
             "At least one of the model submodule will be offloaded to disk, please pass along an `offload_folder`."
@@ -825,3 +872,5 @@ def load_checkpoint_in_model(
     if offload_state_dict:
         load_offloaded_weights(model, state_dict_index, state_dict_folder)
         shutil.rmtree(state_dict_folder)
+
+    retie_parameters(model, tied_params)

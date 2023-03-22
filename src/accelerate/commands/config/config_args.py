@@ -22,7 +22,7 @@ from typing import List, Optional, Union
 
 import yaml
 
-from ...utils import ComputeEnvironment, DistributedType, DynamoBackend, SageMakerDistributedType
+from ...utils import ComputeEnvironment, DistributedType, SageMakerDistributedType
 from ...utils.constants import SAGEMAKER_PYTHON_VERSION, SAGEMAKER_PYTORCH_VERSION, SAGEMAKER_TRANSFORMERS_VERSION
 
 
@@ -78,7 +78,6 @@ class BaseConfig:
     distributed_type: Union[DistributedType, SageMakerDistributedType]
     mixed_precision: str
     use_cpu: bool
-    dynamo_backend: DynamoBackend
 
     def to_dict(self):
         result = self.__dict__
@@ -100,10 +99,11 @@ class BaseConfig:
             config_dict["mixed_precision"] = "fp16" if ("fp16" in config_dict and config_dict["fp16"]) else None
         if "fp16" in config_dict:  # Convert the config to the new format.
             del config_dict["fp16"]
+        if "dynamo_backend" in config_dict:  # Convert the config to the new format.
+            dynamo_backend = config_dict.pop("dynamo_backend")
+            config_dict["dynamo_config"] = {} if dynamo_backend == "NO" else {"dynamo_backend": dynamo_backend}
         if "use_cpu" not in config_dict:
             config_dict["use_cpu"] = False
-        if "dynamo_backend" not in config_dict:
-            config_dict["dynamo_backend"] = DynamoBackend.NO
         return cls(**config_dict)
 
     def to_json_file(self, json_file):
@@ -123,11 +123,11 @@ class BaseConfig:
             config_dict["mixed_precision"] = "fp16" if ("fp16" in config_dict and config_dict["fp16"]) else None
         if "fp16" in config_dict:  # Convert the config to the new format.
             del config_dict["fp16"]
+        if "dynamo_backend" in config_dict:  # Convert the config to the new format.
+            dynamo_backend = config_dict.pop("dynamo_backend")
+            config_dict["dynamo_config"] = {} if dynamo_backend == "NO" else {"dynamo_backend": dynamo_backend}
         if "use_cpu" not in config_dict:
             config_dict["use_cpu"] = False
-        if "dynamo_backend" not in config_dict:
-            config_dict["dynamo_backend"] = DynamoBackend.NO
-
         return cls(**config_dict)
 
     def to_yaml_file(self, yaml_file):
@@ -142,8 +142,8 @@ class BaseConfig:
                 self.distributed_type = SageMakerDistributedType(self.distributed_type)
             else:
                 self.distributed_type = DistributedType(self.distributed_type)
-        if isinstance(self.dynamo_backend, str):
-            self.dynamo_backend = DynamoBackend(self.dynamo_backend.upper())
+        if self.dynamo_config is None:
+            self.dynamo_config = {}
 
 
 @dataclass
@@ -177,6 +177,9 @@ class ClusterConfig(BaseConfig):
     tpu_vm: List[str] = None
     tpu_env: List[str] = None
 
+    # args for dynamo
+    dynamo_config: dict = None
+
     def __post_init__(self):
         if self.deepspeed_config is None:
             self.deepspeed_config = {}
@@ -203,3 +206,4 @@ class SageMakerConfig(BaseConfig):
     sagemaker_inputs_file: str = None
     sagemaker_metrics_file: str = None
     additional_args: dict = None
+    dynamo_config: dict = None
