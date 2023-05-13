@@ -137,6 +137,7 @@ class InitProcessGroupKwargs(KwargsHandler):
     ```
     """
 
+    backend: Optional[str] = "nccl"
     init_method: Optional[str] = None
     timeout: timedelta = timedelta(seconds=1800)
 
@@ -182,6 +183,7 @@ class DistributedType(str, enum.Enum):
         - **NO** -- Not a distributed environment, just a single process.
         - **MULTI_CPU** -- Distributed on multiple CPU nodes.
         - **MULTI_GPU** -- Distributed on multiple GPUs.
+        - **MULTI_XPU** -- Distributed on multiple XPUs.
         - **DEEPSPEED** -- Using DeepSpeed.
         - **TPU** -- Distributed on TPUs.
     """
@@ -190,6 +192,7 @@ class DistributedType(str, enum.Enum):
     NO = "NO"
     MULTI_CPU = "MULTI_CPU"
     MULTI_GPU = "MULTI_GPU"
+    MULTI_XPU = "MULTI_XPU"
     DEEPSPEED = "DEEPSPEED"
     FSDP = "FSDP"
     TPU = "TPU"
@@ -335,6 +338,7 @@ class RNGType(BaseEnum):
     TORCH = "torch"
     CUDA = "cuda"
     XLA = "xla"
+    XPU = "xpu"
     GENERATOR = "generator"
 
 
@@ -515,17 +519,25 @@ class DeepSpeedPlugin:
                 raise ValueError("Please specify the ZeRO optimization config in the DeepSpeed config.")
 
             self._deepspeed_config_checks()
-            kwargs = {
-                "gradient_accumulation_steps": self.gradient_accumulation_steps,
-                "gradient_clipping": self.gradient_clipping if self.gradient_clipping else 1.0,
-                "zero_optimization.stage": self.zero_stage,
-                "zero_optimization.offload_optimizer.device": self.offload_optimizer_device,
-                "zero_optimization.offload_param.device": self.offload_param_device,
-                "zero_optimization.stage3_gather_16bit_weights_on_model_save": self.zero3_save_16bit_model,
+            plugin_to_config_mapping = {
+                "gradient_accumulation_steps": "gradient_accumulation_steps",
+                "gradient_clipping": "gradient_clipping",
+                "zero_stage": "zero_optimization.stage",
+                "offload_optimizer_device": "zero_optimization.offload_optimizer.device",
+                "offload_param_device": "zero_optimization.offload_param.device",
+                "zero3_save_16bit_model": "zero_optimization.stage3_gather_16bit_weights_on_model_save",
             }
+            kwargs = {v: getattr(self, k) for k, v in plugin_to_config_mapping.items() if getattr(self, k) is not None}
             for key in kwargs.keys():
                 self.fill_match(key, **kwargs, must_match=False)
             self.hf_ds_config.set_stage_and_offload()
+
+            # filling the missing values in the class attributes from the DeepSpeed config
+            # when using the DeepSpeed config file.
+            for key, value in plugin_to_config_mapping.items():
+                config_value = self.hf_ds_config.get_value(value)
+                if config_value is not None and config_value != "auto":
+                    setattr(self, key, config_value)
         else:
             config = {
                 "train_batch_size": "auto",
@@ -1316,3 +1328,16 @@ class MegatronLMPlugin:
                 self.megatron_lm_default_args[key] = True
             elif key.startswith("no_log_"):
                 self.megatron_lm_default_args[key.replace("no_", "")] = True
+
+
+@dataclass
+class IntelPyTorchExtensionPlugin:
+    """
+    This plugin is used to enable Intel PyTorch Extension (IPEX).
+    """
+
+    def set_mixed_precision(self, mixed_precision):
+        if mixed_precision == "fp16":
+            raise ValueError("Tried to use `fp16` but it is not supported on cpu or xpu")
+        elif mixed_precision == "bf16":
+            self.dtype = torch.bfloat16

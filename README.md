@@ -16,7 +16,7 @@ limitations under the License.
 
 <p align="center">
     <br>
-    <img src="docs/source/imgs/accelerate_logo.png" width="400"/>
+    <img src="https://raw.githubusercontent.com/huggingface/accelerate/main/docs/source/imgs/accelerate_logo.png" width="400"/>
     <br>
 <p>
 
@@ -223,7 +223,7 @@ If you like the simplicity of 🤗 Accelerate but would prefer a higher-level ab
 
 ## Installation
 
-This repository is tested on Python 3.6+ and PyTorch 1.4.0+
+This repository is tested on Python 3.7+ and PyTorch 1.4.0+
 
 You should install 🤗 Accelerate in a [virtual environment](https://docs.python.org/3/library/venv.html). If you're unfamiliar with Python virtual environments, check out the [user guide](https://packaging.python.org/guides/installing-using-pip-and-virtual-environments/).
 

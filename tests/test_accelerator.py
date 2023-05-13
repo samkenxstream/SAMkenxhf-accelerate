@@ -1,7 +1,6 @@
 import json
 import os
 import tempfile
-import unittest
 from unittest.mock import patch
 
 import torch
@@ -9,7 +8,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from accelerate import infer_auto_device_map, init_empty_weights
 from accelerate.accelerator import Accelerator
-from accelerate.state import PartialState
+from accelerate.state import GradientState, PartialState
 from accelerate.test_utils import require_multi_gpu, slow
 from accelerate.test_utils.testing import AccelerateTestCase, require_cuda
 from accelerate.utils import patch_environment
@@ -42,6 +41,18 @@ class AcceleratorTester(AccelerateTestCase):
         assert PartialState._shared_state["device"].type == "cuda"
         with self.assertRaises(ValueError):
             _ = Accelerator(cpu=True)
+
+    def test_mutable_states(self):
+        accelerator = Accelerator()
+        state = GradientState()
+        assert state.num_steps == 1
+        accelerator.gradient_accumulation_steps = 4
+        assert state.num_steps == 4
+
+        assert state.sync_gradients is True
+        accelerator.sync_gradients = False
+        assert state.sync_gradients is False
+        GradientState._reset_state()
 
     def test_prepared_objects_are_referenced(self):
         accelerator = Accelerator()
@@ -172,7 +183,7 @@ class AcceleratorTester(AccelerateTestCase):
         model = AutoModelForCausalLM.from_pretrained(
             "EleutherAI/gpt-neo-125m",
             load_in_8bit=True,
-            device_map="auto",
+            device_map={"": 0},
         )
         accelerator = Accelerator()
 
@@ -180,7 +191,6 @@ class AcceleratorTester(AccelerateTestCase):
         model = accelerator.prepare(model)
 
     @slow
-    @unittest.skip("Skip until the next `transformers` release")
     def test_accelerator_bnb_cpu_error(self):
         """Tests that the accelerator can be used with the BNB library. This should fail as we are trying to load a model
         that is loaded between cpu and gpu"""
