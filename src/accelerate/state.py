@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+import math
 import os
 import threading
 import warnings
@@ -118,12 +121,17 @@ class PartialState:
             self.backend = None
             env_device = os.environ.get("ACCELERATE_TORCH_DEVICE", None)
             self.device = torch.device(env_device) if env_device is not None else None
-            if (
-                os.environ.get("ACCELERATE_USE_SAGEMAKER", "false") == "true"
-                and os.environ.get("ACCELERATE_SAGEMAKER_DISTRIBUTED_TYPE") != SageMakerDistributedType.NO
-                and not cpu
-            ):
-                if os.environ.get("ACCELERATE_SAGEMAKER_DISTRIBUTED_TYPE") == SageMakerDistributedType.DATA_PARALLEL:
+            use_sagemaker_dp = kwargs.pop("_use_sagemaker_dp", None)
+            if use_sagemaker_dp is None:
+                use_sagemaker_dp = (
+                    os.environ.get("ACCELERATE_USE_SAGEMAKER", "false") == "true"
+                    and os.environ.get("ACCELERATE_SAGEMAKER_DISTRIBUTED_TYPE") != SageMakerDistributedType.NO
+                )
+
+            if use_sagemaker_dp and not cpu:
+                if (
+                    os.environ.get("ACCELERATE_SAGEMAKER_DISTRIBUTED_TYPE") == SageMakerDistributedType.DATA_PARALLEL
+                ) or use_sagemaker_dp:
                     self.distributed_type = DistributedType.MULTI_GPU
                     import smdistributed.dataparallel.torch.torch_smddp  # noqa
 
@@ -224,7 +232,7 @@ class PartialState:
                         )
                 if not torch.distributed.is_initialized():
                     # Backend is not set by the user, we set it here
-                    kwargs.pop("nccl_backend", None)
+                    kwargs.pop("backend", None)
                     self.backend = backend
                     torch.distributed.init_process_group(self.backend, rank=rank, world_size=size, **kwargs)
                 self.num_processes = torch.distributed.get_world_size()
@@ -329,6 +337,84 @@ class PartialState:
 
         if is_main:
             self.wait_for_everyone()
+
+    @contextmanager
+    def split_between_processes(self, inputs: list | tuple | dict | torch.Tensor, apply_padding: bool = False):
+        """
+        Splits `input` between `self.num_processes` quickly and can be then used on that process. Useful when doing
+        distributed inference, such as with different prompts.
+
+        Note that when using a `dict`, all keys need to have the same number of elements.
+
+        Args:
+            inputs (`list`, `tuple`, `torch.Tensor`, or `dict` of `list`/`tuple`/`torch.Tensor`):
+                The input to split between processes.
+            apply_padding (`bool`, `optional`, defaults to `False`):
+                Whether to apply padding by repeating the last element of the input so that all processes have the same
+                number of elements. Useful when trying to perform actions such as `gather()` on the outputs or passing
+                in less inputs than there are processes. If so, just remember to drop the padded elements afterwards.
+
+
+        Example:
+
+        ```python
+        # Assume there are two processes
+        from accelerate import PartialState
+
+        state = PartialState()
+        with state.split_between_processes(["A", "B", "C"]) as inputs:
+            print(inputs)
+        # Process 0
+        ["A", "B"]
+        # Process 1
+        ["C"]
+
+        with state.split_between_processes(["A", "B", "C"], apply_padding=True) as inputs:
+            print(inputs)
+        # Process 0
+        ["A", "B"]
+        # Process 1
+        ["C", "C"]
+        ```
+        """
+        if self.num_processes == 1:
+            yield inputs
+            return
+        # Nested dictionary of any types
+        if isinstance(inputs, dict):
+            length = len(inputs[list(inputs.keys())[0]])
+            if not all(len(v) == length for v in inputs.values()):
+                raise ValueError("All values in the dictionary must have the same length")
+        num_samples_per_process = math.ceil(len(inputs) / self.num_processes)
+        start_index = self.process_index * num_samples_per_process
+        end_index = start_index + num_samples_per_process
+        if (len(inputs) % self.num_processes != 0) and (self.process_index == self.num_processes - 1):
+            if isinstance(inputs, (list, tuple, torch.Tensor)):
+                end_index = len(inputs)
+            elif isinstance(inputs, dict):
+                end_index = len(inputs[list(inputs.keys())[0]])
+
+        def _split_values(inputs, start_index, end_index):
+            if isinstance(inputs, (list, tuple, torch.Tensor)):
+                result = inputs[start_index:end_index]
+                if apply_padding:
+                    if isinstance(result, torch.Tensor):
+                        from accelerate.utils import pad_across_processes, send_to_device
+
+                        # The tensor needs to be on the device before we can pad it
+                        tensorized_result = send_to_device(result, self.device)
+                        result = pad_across_processes(tensorized_result, pad_index=inputs[-1])
+                    else:
+                        result += [result[-1]] * (num_samples_per_process - len(result))
+                return result
+            elif isinstance(inputs, dict):
+                for key in inputs.keys():
+                    inputs[key] = _split_values(inputs[key], start_index, end_index)
+                return inputs
+            else:
+                return inputs
+
+        yield _split_values(inputs, start_index, end_index)
 
     @contextmanager
     def main_process_first(self):
@@ -634,13 +720,12 @@ class AcceleratorState:
                     self.distributed_type = DistributedType.MEGATRON_LM
                     megatron_lm_plugin.set_mixed_precision(self._mixed_precision)
                     self.megatron_lm_plugin = megatron_lm_plugin
-            elif self.distributed_type in [DistributedType.MULTI_CPU, DistributedType.NO]:
-                if self.device.type == "cpu" and ipex_plugin is not None:
-                    self.ipex_plugin = ipex_plugin
-                    if self.ipex_plugin is not None:
-                        self.ipex_plugin.set_mixed_precision(mixed_precision)
-            if self.distributed_type in [DistributedType.MULTI_XPU, DistributedType.NO]:
-                if self.device.type == "xpu" and ipex_plugin is not None:
+            elif self.distributed_type in [DistributedType.MULTI_CPU, DistributedType.MULTI_XPU, DistributedType.NO]:
+                if (
+                    self.device.type == "cpu"
+                    or (self.device.type == "xpu" and is_xpu_available())
+                    and ipex_plugin is not None
+                ):
                     self.ipex_plugin = ipex_plugin
                     if self.ipex_plugin is not None:
                         self.ipex_plugin.set_mixed_precision(mixed_precision)
@@ -730,6 +815,48 @@ class AcceleratorState:
 
     def wait_for_everyone(self):
         PartialState().wait_for_everyone()
+
+    @contextmanager
+    def split_between_processes(self, inputs: list | tuple | dict | torch.Tensor, apply_padding: bool = False):
+        """
+        Splits `input` between `self.num_processes` quickly and can be then used on that process. Useful when doing
+        distributed inference, such as with different prompts.
+
+        Note that when using a `dict`, all keys need to have the same number of elements.
+
+        Args:
+            inputs (`list`, `tuple`, `torch.Tensor`, or `dict` of `list`/`tuple`/`torch.Tensor`):
+                The input to split between processes.
+            apply_padding (`bool`, `optional`, defaults to `False`):
+                Whether to apply padding by repeating the last element of the input so that all processes have the same
+                number of elements. Useful when trying to perform actions such as `gather()` on the outputs or passing
+                in less inputs than there are processes. If so, just remember to drop the padded elements afterwards.
+
+
+        Example:
+
+        ```python
+        # Assume there are two processes
+        from accelerate.state import AcceleratorState
+
+        state = AcceleratorState()
+        with state.split_between_processes(["A", "B", "C"]) as inputs:
+            print(inputs)
+        # Process 0
+        ["A", "B"]
+        # Process 1
+        ["C"]
+
+        with state.split_between_processes(["A", "B", "C"], apply_padding=True) as inputs:
+            print(inputs)
+        # Process 0
+        ["A", "B"]
+        # Process 1
+        ["C", "C"]
+        ```
+        """
+        with PartialState().split_between_processes(inputs, apply_padding=apply_padding) as inputs:
+            yield inputs
 
     @contextmanager
     def main_process_first(self):

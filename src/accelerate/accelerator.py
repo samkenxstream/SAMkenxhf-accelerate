@@ -530,6 +530,48 @@ class Accelerator:
     def mixed_precision(self):
         return self.state.mixed_precision
 
+    @contextmanager
+    def split_between_processes(self, inputs: list | tuple | dict | torch.Tensor, apply_padding: bool = False):
+        """
+        Splits `input` between `self.num_processes` quickly and can be then used on that process. Useful when doing
+        distributed inference, such as with different prompts.
+
+        Note that when using a `dict`, all keys need to have the same number of elements.
+
+        Args:
+            inputs (`list`, `tuple`, `torch.Tensor`, or `dict` of `list`/`tuple`/`torch.Tensor`):
+                The input to split between processes.
+            apply_padding (`bool`, `optional`, defaults to `False`):
+                Whether to apply padding by repeating the last element of the input so that all processes have the same
+                number of elements. Useful when trying to perform actions such as `Accelerator.gather()` on the outputs
+                or passing in less inputs than there are processes. If so, just remember to drop the padded elements
+                afterwards.
+
+        Example:
+
+        ```python
+        # Assume there are two processes
+        from accelerate import Accelerator
+
+        accelerator = Accelerator()
+        with accelerator.split_between_processes(["A", "B", "C"]) as inputs:
+            print(inputs)
+        # Process 0
+        ["A", "B"]
+        # Process 1
+        ["C"]
+
+        with accelerator.split_between_processes(["A", "B", "C"], apply_padding=True) as inputs:
+            print(inputs)
+        # Process 0
+        ["A", "B"]
+        # Process 1
+        ["C", "C"]
+        ```
+        """
+        with PartialState().split_between_processes(inputs, apply_padding=apply_padding) as inputs:
+            yield inputs
+
     def on_main_process(self, function: Callable[..., Any] = None):
         """
         A decorator that will run the decorated function on the main process only. Can also be called using the
@@ -2709,13 +2751,19 @@ class Accelerator:
 
         >>> accelerator = Accelerator()
         >>> dataloader, model, optimizer, scheduler = accelerator.prepare(dataloader, model, optimizer, scheduler)
-
-        >>> for input, target in accelerator.skip_first_batches(dataloader, num_batches=2):
+        >>> skipped_dataloader = accelerator.skip_first_batches(dataloader, num_batches=2)
+        >>> # for the first epoch only
+        >>> for input, target in skipped_dataloader:
         ...     optimizer.zero_grad()
         ...     output = model(input)
         ...     loss = loss_func(output, target)
         ...     accelerator.backward(loss)
         ...     optimizer.step()
+
+        >>> # subsequent epochs
+        >>> for input, target in dataloader:
+        ...     optimizer.zero_grad()
+        ...     ...
         ```
         """
         return skip_first_batches(dataloader, num_batches=num_batches)

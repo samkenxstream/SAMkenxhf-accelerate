@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import enum
 import gc
 import json
 import logging
@@ -41,6 +42,14 @@ WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
 
 
 logger = logging.getLogger(__name__)
+
+
+class CustomDtype(enum.Enum):
+    r"""
+    An enum that contains multiple custom dtypes that can be used for `infer_auto_device_map`.
+    """
+    FP8 = "fp8"
+    INT4 = "int4"
 
 
 def convert_file_size_to_int(size: Union[int, str]):
@@ -90,6 +99,10 @@ def dtype_byte_size(dtype: torch.dtype):
     """
     if dtype == torch.bool:
         return 1 / 8
+    elif dtype == CustomDtype.INT4:
+        return 1 / 2
+    elif dtype == CustomDtype.FP8:
+        return 1
     bit_search = re.search(r"[^\d](\d+)$", str(dtype))
     if bit_search is None:
         raise ValueError(f"`dtype` is not a valid dtype: {dtype}.")
@@ -159,9 +172,9 @@ def set_module_tensor_to_device(
         elif value is not None or torch.device(device) != module._parameters[tensor_name].device:
             param_cls = type(module._parameters[tensor_name])
             kwargs = module._parameters[tensor_name].__dict__
-            if param_cls.__name__ == "Int8Params":
-                # downcast to fp16 if any
-                if new_value.dtype == torch.float32:
+            if param_cls.__name__ in ["Int8Params", "FP4Params"]:
+                if param_cls.__name__ == "Int8Params" and new_value.dtype == torch.float32:
+                    # downcast to fp16 if any - needed for 8bit serialization
                     new_value = new_value.to(torch.float16)
                 new_value = param_cls(new_value, requires_grad=old_value.requires_grad, **kwargs).to(device)
             else:
@@ -533,7 +546,7 @@ def get_balanced_memory(
     module_sizes = {n: v for n, v in module_sizes.items() if n not in leaves}
     # Once removed, leaves are the final modules.
     leaves = [n for n in module_sizes if len([p for p in module_sizes if n == "" or p.startswith(n + ".")]) == 0]
-    mean_leaves = int(sum([module_sizes[n] for n in leaves]) / len(leaves))
+    mean_leaves = int(sum([module_sizes[n] for n in leaves]) / max(len(leaves), 1))
     buffer = int(1.25 * max(buffer, mean_leaves))
     per_gpu += buffer
 
@@ -660,7 +673,7 @@ def infer_auto_device_map(
         # Case 1 -> We're too big!
         if current_max_size is not None and current_memory_used + module_size > current_max_size:
             # Split or not split?
-            modules_children = list(module.named_children())
+            modules_children = [] if isinstance(module, nn.Parameter) else list(module.named_children())
             if verbose:
                 print(
                     f"Not enough space on {devices[current_device]} to put {name} (space available "
@@ -763,9 +776,13 @@ def infer_auto_device_map(
 
         else:
             if verbose:
-                print(
-                    f"Putting {name} (size={module_size}) on {devices[current_device]} (available={current_max_size-current_memory_used})."
-                )
+                if current_max_size is None:
+                    print(f"Putting {name} (size={module_size}) on {devices[current_device]}.")
+                else:
+                    print(
+                        f"Putting {name} (size={module_size}) on {devices[current_device]} "
+                        f"(available={current_max_size-current_memory_used})."
+                    )
             current_memory_used += module_size
             device_map[name] = devices[current_device]
 
